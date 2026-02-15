@@ -16,7 +16,6 @@ AssetScriber is a shell script designed to generate Software Bill of Materials (
 The script attempts to be self-sufficient but relies on a few common tools. It will log an error and skip the relevant task if a tool is not found.
 
 - **`curl`**: (Optional) Required for the automatic download of `syft` and `jq`.
-- **`rsync`**: **(Required for remote scans)**.
 - **`ssh`**: **(Required for remote scans)**.
 - **`nmap`**: (Optional) Required only for the network discovery feature (`-d`).
 - **`sshpass`**: (Optional) Required only for password-based authentication to remote hosts.
