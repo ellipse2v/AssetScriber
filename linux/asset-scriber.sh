@@ -1,7 +1,23 @@
 #!/bin/bash
 
+# Copyright 2025 ellipse2v
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 # AssetScriber - An SBOM generation and discovery script
 # It uses syft to scan local and remote targets without installing agents.
+# Version 2: Deploys itself on remote machines instead of rsyncing everything
 
 set -o pipefail
 
@@ -15,6 +31,10 @@ INTERMEDIATE_DIR="${OUTPUT_DIR}/intermediate"
 CSV_OUTPUT_PATH="${OUTPUT_DIR}/master_asset_list.csv"
 STATUS_REPORT_LOG="${OUTPUT_DIR}/status_report.log"
 SYFT_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
+
+# Remote deployment configuration
+REMOTE_WORK_DIR="/tmp/assetscriber_$$"
+REMOTE_SYFT_PATH="${REMOTE_WORK_DIR}/syft"
 
 # --- Global Variables ---
 IS_ROOT=0
@@ -242,11 +262,59 @@ perform_local_scan() {
     process_sbom_to_csv "$sbom_output_path" "$hostname"
 }
 
-# Performs a remote scan by rsyncing files locally first.
-# $1: host IP or name
-# $2: user for SSH
-# $3: password for SSH (optional)
-# $4: path on the remote host to scan
+# Constructs an SSH command with appropriate options
+# $1: user
+# $2: host
+# $3: password (optional)
+# Returns: ssh command array in SSH_CMD variable
+build_ssh_command() {
+    local user=$1
+    local host=$2
+    local pass=$3
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    
+    if [[ -n "$pass" ]]; then
+        if ! command_exists "sshpass"; then
+            log_msg "ERROR" "sshpass is required for password authentication but not found."
+            return 1
+        fi
+        SSH_CMD=("sshpass" "-p" "$pass" "ssh" $ssh_opts "$user@$host")
+    else
+        SSH_CMD=("ssh" $ssh_opts "$user@$host")
+    fi
+    return 0
+}
+
+# Constructs an SCP command with appropriate options
+# $1: user
+# $2: host
+# $3: password (optional)
+# Returns: scp command array in SCP_CMD variable
+build_scp_command() {
+    local user=$1
+    local host=$2
+    local pass=$3
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    
+    if [[ -n "$pass" ]]; then
+        if ! command_exists "sshpass"; then
+            log_msg "ERROR" "sshpass is required for password authentication but not found."
+            return 1
+        fi
+        SCP_CMD=("sshpass" "-p" "$pass" "scp" $ssh_opts)
+    else
+        SCP_CMD=("scp" $ssh_opts)
+    fi
+    return 0
+}
+
+# Performs a remote scan by deploying syft on the remote host
+# $1: hostname
+# $2: user
+# $3: password (optional)
+# $4: path to scan on remote host
 # $5: os_only flag ("true" or "false")
 perform_remote_scan() {
     local host=$1
@@ -255,58 +323,87 @@ perform_remote_scan() {
     local scan_target=$4
     local os_only=$5
 
-    for scanned in "${SCANNED_HOSTS[@]}"; do
-        if [[ "$scanned" == "$host" ]]; then
-            log_msg "WARN" "Host '$host' has already been scanned. Skipping."
-            return 0
-        fi
-    done
+    log_msg "INFO" "Starting remote scan for '$user@$host' (Path: $scan_target)"
 
-    if ! command_exists "rsync"; then
-        log_msg "ERROR" "Skipping remote scan of '$host': 'rsync' command not found."
+    # Build SSH and SCP commands
+    local SSH_CMD
+    local SCP_CMD
+    build_ssh_command "$user" "$host" "$pass" || return 1
+    build_scp_command "$user" "$host" "$pass" || return 1
+
+    # Test SSH connectivity
+    log_msg "INFO" "Testing SSH connection to '$user@$host'..."
+    if ! "${SSH_CMD[@]}" "echo 'SSH connection successful'" &>/dev/null; then
+        log_msg "ERROR" "SSH connection to '$user@$host' failed."
+        return 1
+    fi
+    log_msg "SUCCESS" "SSH connection to '$user@$host' established."
+
+    # Create remote work directory
+    log_msg "INFO" "Creating remote work directory '$REMOTE_WORK_DIR' on '$host'..."
+    if ! "${SSH_CMD[@]}" "mkdir -p '$REMOTE_WORK_DIR'"; then
+        log_msg "ERROR" "Failed to create remote work directory on '$host'."
         return 1
     fi
 
-    local rsync_cmd_args=("-a" "-z" "--info=progress2")
-    local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
-    if [[ -n "$pass" ]]; then
-        if ! command_exists "sshpass"; then
-            log_msg "ERROR" "Skipping remote scan of '$host': 'sshpass' is required for password authentication but is not installed."
-            return 1
-        fi
-        rsync_cmd_args=("-e" "sshpass -p '$pass' ssh $ssh_opts" "${rsync_cmd_args[@]}")
-    else
-        rsync_cmd_args=("-e" "ssh $ssh_opts" "${rsync_cmd_args[@]}")
+    # Deploy syft to remote host
+    log_msg "INFO" "Deploying syft to '$host'..."
+    if [[ ! -f "$SYFT_PATH" ]]; then
+        log_msg "ERROR" "Local syft binary not found at '$SYFT_PATH'."
+        return 1
     fi
 
-    local temp_dir
-    temp_dir=$(mktemp -d -t assetscriber-rsync-XXXXXX)
-    log_msg "INFO" "Created temporary directory for rsync: $temp_dir"
+    if ! "${SCP_CMD[@]}" "$SYFT_PATH" "$user@$host:$REMOTE_SYFT_PATH"; then
+        log_msg "ERROR" "Failed to copy syft to '$host'."
+        "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'" 2>/dev/null
+        return 1
+    fi
 
-    # Add a trailing slash to the source path to copy contents, not the directory itself.
-    local rsync_source_path="${scan_target}"
-    [[ "${rsync_source_path}" != */ ]] && rsync_source_path="${rsync_source_path}/"
+    # Make syft executable on remote host
+    log_msg "INFO" "Making syft executable on '$host'..."
+    if ! "${SSH_CMD[@]}" "chmod +x '$REMOTE_SYFT_PATH'"; then
+        log_msg "ERROR" "Failed to make syft executable on '$host'."
+        "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'" 2>/dev/null
+        return 1
+    fi
 
-    log_msg "INFO" "Starting rsync of '$user@$host:$rsync_source_path' to '$temp_dir'. This may take a long time and consume significant disk space."
+    # Execute syft scan on remote host
+    log_msg "INFO" "Executing syft scan on '$host' (this may take some time)..."
+    local remote_sbom_path="${REMOTE_WORK_DIR}/sbom_${host}.json"
+    local syft_cmd="'$REMOTE_SYFT_PATH' scan 'dir:$scan_target' --output 'cyclonedx-json=$remote_sbom_path'"
     
-    "${rsync_cmd_args[@]}" "$user@$host:$rsync_source_path" "$temp_dir/"
-    local rsync_exit_code=$?
+    if [[ "$os_only" == "true" ]]; then
+        syft_cmd="$syft_cmd --scope squashed"
+    fi
 
-    if [[ $rsync_exit_code -ne 0 ]]; then
-        log_msg "ERROR" "Rsync failed for host '$host' with exit code $rsync_exit_code."
-        rm -rf "$temp_dir"
-        log_msg "INFO" "Cleaned up temporary directory: $temp_dir"
+    if ! "${SSH_CMD[@]}" "$syft_cmd"; then
+        log_msg "ERROR" "Syft scan failed on '$host'."
+        "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'" 2>/dev/null
         return 1
     fi
-    log_msg "SUCCESS" "Rsync completed for host '$host'."
+    log_msg "SUCCESS" "Syft scan completed on '$host'."
 
-    # Since we copied the contents of the target, we scan the temp dir directly.
-    perform_local_scan "$temp_dir" "$host" "$os_only"
+    # Retrieve the SBOM file
+    log_msg "INFO" "Retrieving SBOM file from '$host'..."
+    local local_sbom_path="${OUTPUT_DIR}/sbom_${host}.json"
+    if ! "${SCP_CMD[@]}" "$user@$host:$remote_sbom_path" "$local_sbom_path"; then
+        log_msg "ERROR" "Failed to retrieve SBOM file from '$host'."
+        "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'" 2>/dev/null
+        return 1
+    fi
+    log_msg "SUCCESS" "SBOM file retrieved from '$host'."
+
+    # Clean up remote deployment
+    log_msg "INFO" "Cleaning up remote deployment on '$host'..."
+    if "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'"; then
+        log_msg "SUCCESS" "Remote deployment cleaned up on '$host'."
+    else
+        log_msg "WARN" "Failed to clean up remote deployment on '$host'. Manual cleanup may be required."
+    fi
+
+    # Process the retrieved SBOM
+    process_sbom_to_csv "$local_sbom_path" "$host"
     local scan_exit_code=$?
-
-    log_msg "INFO" "Cleaning up temporary directory: $temp_dir"
-    rm -rf "$temp_dir"
-    log_msg "SUCCESS" "Finished cleanup for host '$host'."
 
     if [[ $scan_exit_code -eq 0 ]]; then
         SCANNED_HOSTS+=("$host")
