@@ -243,7 +243,7 @@ perform_local_scan() {
 
     log_msg "INFO" "Starting local scan for host: '$hostname' (Path: $scan_path)"
 
-    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path")
+    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path" "--exclude" "${BIN_DIR}/**")
 
     if [[ "$os_only" == "true" ]]; then
         syft_args+=("--scope" "squashed")
@@ -370,8 +370,8 @@ perform_remote_scan() {
     # Execute syft scan on remote host
     log_msg "INFO" "Executing syft scan on '$host' (this may take some time)..."
     local remote_sbom_path="${REMOTE_WORK_DIR}/sbom_${host}.json"
-    local syft_cmd="'$REMOTE_SYFT_PATH' scan 'dir:$scan_target' --output 'cyclonedx-json=$remote_sbom_path'"
-    
+    local syft_cmd="'$REMOTE_SYFT_PATH' scan 'dir:$scan_target' --output 'cyclonedx-json=$remote_sbom_path' --exclude '${REMOTE_WORK_DIR}/**'"
+
     if [[ "$os_only" == "true" ]]; then
         syft_cmd="$syft_cmd --scope squashed"
     fi

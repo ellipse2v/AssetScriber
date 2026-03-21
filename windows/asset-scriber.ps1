@@ -168,7 +168,7 @@ function Perform-LocalScan {
 
     $SbomOutputPath = Join-Path $OUTPUT_DIR "sbom_$($Hostname -replace '[/\\]','_').json"
 
-    $SyftArgs = @("scan", "dir:$ScanPath", "--output", "cyclonedx-json=$SbomOutputPath")
+    $SyftArgs = @("scan", "dir:$ScanPath", "--output", "cyclonedx-json=$SbomOutputPath", "--exclude", "$BIN_DIR\**")
 
     if ($OsOnly) {
         $SyftArgs += @("--scope", "squashed")
