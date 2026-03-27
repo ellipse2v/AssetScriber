@@ -243,7 +243,7 @@ perform_local_scan() {
 
     log_msg "INFO" "Starting local scan for host: '$hostname' (Path: $scan_path)"
 
-    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path" "--exclude" "${BIN_DIR}/**")
+    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path" "--exclude" "./${BIN_DIR}/**")
 
     if [[ "$os_only" == "true" ]]; then
         syft_args+=("--scope" "squashed")
