@@ -168,7 +168,15 @@ function Perform-LocalScan {
 
     $SbomOutputPath = Join-Path $OUTPUT_DIR "sbom_$($Hostname -replace '[/\\]','_').json"
 
-    $SyftArgs = @("scan", "dir:$ScanPath", "--output", "cyclonedx-json=$SbomOutputPath", "--exclude", "$BIN_DIR\**")
+    $SyftArgs = @("scan", "dir:$ScanPath", "--output", "cyclonedx-json=$SbomOutputPath")
+
+    # Exclude BIN_DIR only if it falls within the scanned path (syft expects paths relative to scan root)
+    $NormalizedScanPath = $ScanPath.TrimEnd('\') + '\'
+    $NormalizedBinDir = $BIN_DIR.TrimEnd('\') + '\'
+    if ($NormalizedBinDir.StartsWith($NormalizedScanPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $RelBinDir = ($BIN_DIR.Substring($NormalizedScanPath.Length)) -replace '\\','/'
+        $SyftArgs += @("--exclude", "./$RelBinDir/**")
+    }
 
     if ($OsOnly) {
         $SyftArgs += @("--scope", "squashed")

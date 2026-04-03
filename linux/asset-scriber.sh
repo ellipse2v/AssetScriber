@@ -243,7 +243,16 @@ perform_local_scan() {
 
     log_msg "INFO" "Starting local scan for host: '$hostname' (Path: $scan_path)"
 
-    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path" "--exclude" "./${BIN_DIR}/**")
+    local syft_args=("scan" "dir:$scan_path" "--output" "cyclonedx-json=$sbom_output_path")
+
+    # Exclude BIN_DIR only if it falls within the scanned path (syft expects paths relative to scan root)
+    local real_scan_path real_bin_dir
+    real_scan_path=$(realpath "$scan_path" 2>/dev/null || echo "$scan_path")
+    real_bin_dir=$(realpath "$BIN_DIR" 2>/dev/null || echo "$BIN_DIR")
+    if [[ "$real_bin_dir" == "$real_scan_path"/* || "$real_bin_dir" == "$real_scan_path" ]]; then
+        local rel_bin_dir="${real_bin_dir#$real_scan_path/}"
+        syft_args+=("--exclude" "./${rel_bin_dir}/**")
+    fi
 
     if [[ "$os_only" == "true" ]]; then
         syft_args+=("--scope" "squashed")
@@ -370,7 +379,9 @@ perform_remote_scan() {
     # Execute syft scan on remote host
     log_msg "INFO" "Executing syft scan on '$host' (this may take some time)..."
     local remote_sbom_path="${REMOTE_WORK_DIR}/sbom_${host}.json"
-    local syft_cmd="'$REMOTE_SYFT_PATH' scan 'dir:$scan_target' --output 'cyclonedx-json=$remote_sbom_path' --exclude '${REMOTE_WORK_DIR}/**'"
+    # REMOTE_WORK_DIR is absolute; syft expects a path relative to the scan root
+    local remote_exclude="${REMOTE_WORK_DIR#${scan_target%/}/}"
+    local syft_cmd="'$REMOTE_SYFT_PATH' scan 'dir:$scan_target' --output 'cyclonedx-json=$remote_sbom_path' --exclude './${remote_exclude}/**'"
 
     if [[ "$os_only" == "true" ]]; then
         syft_cmd="$syft_cmd --scope squashed"
