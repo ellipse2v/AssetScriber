@@ -1,0 +1,15 @@
+﻿{
+    "generated":  "2026-04-21T18:16:16Z",
+    "tools":  [
+                  {
+                      "name":  "syft",
+                      "version":  "1.42.4",
+                      "source":  "anchore/syft"
+                  },
+                  {
+                      "name":  "jq",
+                      "version":  "1.8.1",
+                      "source":  "jqlang/jq"
+                  }
+              ]
+}

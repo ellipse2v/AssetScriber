@@ -39,6 +39,7 @@ REMOTE_SYFT_PATH="${REMOTE_WORK_DIR}/syft"
 # --- Global Variables ---
 IS_ROOT=0
 JQ_PATH="" # Will be set to the path of the jq executable
+FORCE_UPDATE=0
 declare -a SCANNED_HOSTS
 
 # --- Utility Functions ---
@@ -92,7 +93,8 @@ show_help() {
     echo "                           Format per line: <ip/host> [user] [password]"
     echo "  -d, --discover           Discover and attempt to scan hosts on the local network."
     echo "      --os-only            Only include operating system packages in the output."
-    echo "  -h, --help               Display this help message."
+    echo "      --update             Update bundled syft and jq to their latest versions.
+  -h, --help               Display this help message."
     echo
     echo "If no option is provided, the script scans the local system ('/' if root, '.' otherwise)."
 }
@@ -102,6 +104,11 @@ show_help() {
 # Sets up syft: checks for its existence, otherwise downloads it.
 setup_syft() {
     log_msg "INFO" "Checking for syft executable..."
+    if [[ "$FORCE_UPDATE" -eq 1 ]]; then
+        log_msg "INFO" "Force update: removing existing syft binary..."
+        rm -f "$SYFT_PATH"
+    fi
+
     if [[ -x "$SYFT_PATH" ]]; then
         log_msg "SUCCESS" "syft found at '$SYFT_PATH'."
         return 0
@@ -129,13 +136,18 @@ setup_syft() {
 # Sets up jq: checks for system, local, or downloads it.
 setup_jq() {
     log_msg "INFO" "Checking for jq executable..."
-    if command_exists "jq"; then
+    if [[ "$FORCE_UPDATE" -eq 1 ]]; then
+        log_msg "INFO" "Force update: removing existing local jq binary..."
+        rm -f "$JQ_LOCAL_PATH"
+    fi
+
+    if [[ "$FORCE_UPDATE" -eq 0 ]] && command_exists "jq"; then
         JQ_PATH=$(command -v "jq")
         log_msg "SUCCESS" "Found system-wide jq at '$JQ_PATH'."
         return 0
     fi
 
-    if [[ -x "$JQ_LOCAL_PATH" ]]; then
+    if [[ "$FORCE_UPDATE" -eq 0 ]] && [[ -x "$JQ_LOCAL_PATH" ]]; then
         JQ_PATH="$JQ_LOCAL_PATH"
         log_msg "SUCCESS" "Found local jq at '$JQ_PATH'."
         return 0
@@ -150,7 +162,16 @@ setup_jq() {
     local arch
     arch=$(uname -m)
     local jq_url
-    local jq_version="1.7.1" # Using a specific stable version
+    local jq_version
+
+    log_msg "INFO" "Fetching latest jq version from GitHub..."
+    jq_version=$(curl -sSf "https://api.github.com/repos/jqlang/jq/releases/latest" 2>/dev/null         | grep '"tag_name"' | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [[ -z "$jq_version" ]]; then
+        log_msg "WARN" "Could not determine latest jq version; falling back to 1.7.1."
+        jq_version="1.7.1"
+    else
+        log_msg "INFO" "Latest jq version: $jq_version"
+    fi
 
     case "$arch" in
         "x86_64")
@@ -179,6 +200,33 @@ setup_jq() {
     log_msg "ERROR" "Failed to download or make jq executable."
     rm -f "$JQ_LOCAL_PATH"
     return 1
+}
+
+# Generates a bom.json in BIN_DIR recording the bundled tool versions.
+generate_tools_bom() {
+    log_msg "INFO" "Generating tools BOM in '$BIN_DIR'..."
+
+    local bom_path="${BIN_DIR}/bom.json"
+    local syft_version jq_version generated
+
+    syft_version=$("$SYFT_PATH" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ -z "$syft_version" ]] && syft_version="unknown"
+
+    jq_version=$("$JQ_LOCAL_PATH" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    [[ -z "$jq_version" ]] && jq_version="unknown"
+
+    generated=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+    cat > "$bom_path" <<EOF
+{
+  "generated": "$generated",
+  "tools": [
+    { "name": "syft", "version": "$syft_version", "source": "anchore/syft" },
+    { "name": "jq",   "version": "$jq_version",   "source": "jqlang/jq" }
+  ]
+}
+EOF
+    log_msg "SUCCESS" "Tools BOM written to '$bom_path'."
 }
 
 
@@ -259,7 +307,10 @@ perform_local_scan() {
     fi
 
     "$SYFT_PATH" "${syft_args[@]}"
-    
+
+    # Pretty-print JSON so it can be opened in basic editors (e.g. Notepad)
+    "$JQ_PATH" . "$sbom_output_path" > "${sbom_output_path}.tmp" && mv "${sbom_output_path}.tmp" "$sbom_output_path"
+
     local exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         log_msg "ERROR" "Syft scan failed for '$hostname' with exit code $exit_code."
@@ -404,6 +455,9 @@ perform_remote_scan() {
     fi
     log_msg "SUCCESS" "SBOM file retrieved from '$host'."
 
+    # Pretty-print JSON so it can be opened in basic editors (e.g. Notepad)
+    "$JQ_PATH" . "$local_sbom_path" > "${local_sbom_path}.tmp" && mv "${local_sbom_path}.tmp" "$local_sbom_path"
+
     # Clean up remote deployment
     log_msg "INFO" "Cleaning up remote deployment on '$host'..."
     if "${SSH_CMD[@]}" "rm -rf '$REMOTE_WORK_DIR'"; then
@@ -543,12 +597,7 @@ main() {
     echo "AssetScriber Status Report - $(date)" > "$STATUS_REPORT_LOG"
     echo "-------------------------------------" >> "$STATUS_REPORT_LOG"
 
-    if ! setup_syft || ! setup_jq; then
-        log_msg "ERROR" "Critical dependency setup failed. Exiting."
-        exit 1
-    fi
-
-    # --- Argument Parsing ---
+    # --- Argument Parsing (must run before setup to honour --update) ---
     local scan_path_arg=""
     local config_file_arg=""
     local discover_arg=0
@@ -559,6 +608,7 @@ main() {
         key="$1"
         case $key in
             -h|--help) show_help; exit 0 ;;
+            --update) FORCE_UPDATE=1; shift ;;
             -p|--path) scan_path_arg="$2"; shift 2 ;;
             -c|--config) config_file_arg="$2"; shift 2 ;;
             -d|--discover) discover_arg=1; shift ;;
@@ -566,6 +616,22 @@ main() {
             *) log_msg "ERROR" "Unknown option: $1"; show_help; exit 1 ;;
         esac
     done
+
+    if ! setup_syft || ! setup_jq; then
+        log_msg "ERROR" "Critical dependency setup failed. Exiting."
+        exit 1
+    fi
+
+    if [[ "$FORCE_UPDATE" -eq 1 ]]; then
+        generate_tools_bom
+        log_msg "SUCCESS" "Update complete."
+        exit 0
+    fi
+
+    # Generate BOM on first install (bom.json absent)
+    if [[ -x "$SYFT_PATH" ]] && [[ ! -f "${BIN_DIR}/bom.json" ]]; then
+        generate_tools_bom
+    fi
 
     # --- Mode Selection Logic ---
     local scan_target

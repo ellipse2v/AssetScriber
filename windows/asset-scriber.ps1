@@ -18,7 +18,8 @@ param (
     [string]$Path = "",
     [string]$Config = "",
     [switch]$Discover,
-    [switch]$OsOnly
+    [switch]$OsOnly,
+    [switch]$Update
 )
 
 # --- Configuration ---
@@ -82,6 +83,7 @@ function Show-Help {
     Write-Host "                           Format per line: <ip/host> [user] [password]"
     Write-Host "  -Discover                Discover and attempt to scan hosts on the local network."
     Write-Host "  -OsOnly                  Only include operating system packages in the output."
+    Write-Host "  -Update                  Update bundled syft and jq to their latest versions."
     Write-Host "  -Help                    Display this help message."
     Write-Host ""
     Write-Host "If no option is provided, the script scans the local system ('/' if root, '.' otherwise)."
@@ -89,25 +91,103 @@ function Show-Help {
 
 # --- Core Functions ---
 
+function Download-LatestSyft {
+    Log-Message -Type "INFO" -Message "Fetching latest syft release from GitHub..."
+    try {
+        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/anchore/syft/releases/latest" -UseBasicParsing
+        $Version = $Release.tag_name -replace '^v', ''
+        $AssetName = "syft_${Version}_windows_amd64.zip"
+        $Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+        if (-not $Asset) {
+            Log-Message -Type "ERROR" -Message "Could not find syft asset '$AssetName' in latest release."
+            return $false
+        }
+        $TempZip = Join-Path $env:TEMP "syft_update.zip"
+        $TempExtract = Join-Path $env:TEMP "syft_update_extract"
+        Log-Message -Type "INFO" -Message "Downloading syft $Version..."
+        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $TempZip -UseBasicParsing
+        Expand-Archive -Path $TempZip -DestinationPath $TempExtract -Force
+        Move-Item -Path (Join-Path $TempExtract "syft.exe") -Destination $SYFT_PATH -Force
+        Remove-Item -Path $TempZip, $TempExtract -Recurse -ErrorAction SilentlyContinue
+        Log-Message -Type "SUCCESS" -Message "syft $Version installed to '$SYFT_PATH'."
+        return $true
+    } catch {
+        Log-Message -Type "ERROR" -Message "Failed to download syft: $_"
+        return $false
+    }
+}
+
+function Download-LatestJq {
+    Log-Message -Type "INFO" -Message "Fetching latest jq release from GitHub..."
+    try {
+        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/jqlang/jq/releases/latest" -UseBasicParsing
+        $AssetName = "jq-windows-amd64.exe"
+        $Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+        if (-not $Asset) {
+            Log-Message -Type "ERROR" -Message "Could not find jq asset '$AssetName' in latest release."
+            return $false
+        }
+        $Version = $Release.tag_name -replace '^jq-', ''
+        Log-Message -Type "INFO" -Message "Downloading jq $Version..."
+        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $JQ_PATH -UseBasicParsing
+        Log-Message -Type "SUCCESS" -Message "jq $Version installed to '$JQ_PATH'."
+        return $true
+    } catch {
+        Log-Message -Type "ERROR" -Message "Failed to download jq: $_"
+        return $false
+    }
+}
+
+function Generate-ToolsBom {
+    Log-Message -Type "INFO" -Message "Generating tools BOM in '$BIN_DIR'..."
+
+    $BomPath = Join-Path $BIN_DIR "bom.json"
+
+    $SyftVersionOutput = & $SYFT_PATH --version 2>$null
+    $SyftVersion = if ($SyftVersionOutput -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { "unknown" }
+
+    $JqVersionOutput = & $JQ_PATH --version 2>$null
+    $JqVersion = if ($JqVersionOutput -match '(\d+\.\d+(\.\d+)?)') { $Matches[1] } else { "unknown" }
+
+    $Bom = [ordered]@{
+        generated = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+        tools     = @(
+            [ordered]@{ name = "syft"; version = $SyftVersion; source = "anchore/syft" }
+            [ordered]@{ name = "jq";   version = $JqVersion;   source = "jqlang/jq" }
+        )
+    }
+
+    $Bom | ConvertTo-Json -Depth 3 | Set-Content -Path $BomPath -Encoding UTF8
+    Log-Message -Type "SUCCESS" -Message "Tools BOM written to '$BomPath'."
+}
+
 function Setup-Syft {
     Log-Message -Type "INFO" -Message "Checking for syft executable..."
+    if ($Update) {
+        Log-Message -Type "INFO" -Message "Force update: removing existing syft binary..."
+        Remove-Item -Path $SYFT_PATH -ErrorAction SilentlyContinue
+        return Download-LatestSyft
+    }
     if (Test-Path $SYFT_PATH) {
         Log-Message -Type "SUCCESS" -Message "syft found at '$SYFT_PATH'."
         return $true
     }
-    
-    Log-Message -Type "ERROR" -Message "syft not found at '$SYFT_PATH'. Please ensure it's present."
+    Log-Message -Type "ERROR" -Message "syft not found at '$SYFT_PATH'. Please place it there or run with -Update."
     return $false
 }
 
 function Setup-Jq {
     Log-Message -Type "INFO" -Message "Checking for jq executable..."
+    if ($Update) {
+        Log-Message -Type "INFO" -Message "Force update: removing existing jq binary..."
+        Remove-Item -Path $JQ_PATH -ErrorAction SilentlyContinue
+        return Download-LatestJq
+    }
     if (Test-Path $JQ_PATH) {
         Log-Message -Type "SUCCESS" -Message "jq found at '$JQ_PATH'."
         return $true
     }
-    
-    Log-Message -Type "ERROR" -Message "jq not found at '$JQ_PATH'. Please ensure it's present."
+    Log-Message -Type "ERROR" -Message "jq not found at '$JQ_PATH'. Please place it there or run with -Update."
     return $false
 }
 
@@ -192,6 +272,11 @@ function Perform-LocalScan {
     }
 
     Log-Message -Type "SUCCESS" -Message "SBOM generated for '$Hostname' at '$SbomOutputPath'."
+
+    # Pretty-print JSON so it can be opened in basic editors (e.g. Notepad)
+    $PrettyJson = & $JQ_PATH . $SbomOutputPath
+    $PrettyJson | Set-Content -Path $SbomOutputPath -Encoding UTF8
+
     Process-SbomToCsv -SbomFile $SbomOutputPath -Hostname $Hostname
     return $true
 }
@@ -365,6 +450,18 @@ function Main {
     if (-not (Setup-Syft) -or -not (Setup-Jq)) {
         Log-Message -Type "ERROR" -Message "Critical dependency setup failed. Exiting."
         exit 1
+    }
+
+    if ($Update) {
+        Generate-ToolsBom
+        Log-Message -Type "SUCCESS" -Message "Update complete."
+        exit 0
+    }
+
+    # Generate BOM on first install (bom.json absent)
+    $BomFile = Join-Path $BIN_DIR "bom.json"
+    if ((Test-Path $SYFT_PATH) -and -not (Test-Path $BomFile)) {
+        Generate-ToolsBom
     }
 
     # --- Mode Selection Logic ---
